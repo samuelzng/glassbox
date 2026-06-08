@@ -1,70 +1,139 @@
-# llm/bpe — Byte-Pair Encoding 分词器
+# llm/bpe — Byte-Pair Encoding tokenizer
 
-> **📌 一手出处 / official reference**
-> - 论文 *Neural Machine Translation of Rare Words with Subword Units* — Sennrich et al., ACL 2016 · [arXiv:1508.07909](https://arxiv.org/abs/1508.07909)
-> - 教学级参考实现 [karpathy/minbpe](https://github.com/karpathy/minbpe)
+A byte-level BPE tokenizer (~180-line core + showcase), trained on the Taylor Swift Wikipedia article
+in **two languages** to show how byte-level BPE behaves on Latin vs CJK script. Two
+training paths (naive + a heap-based fast one) produce **identical** merges, full
+`encode`/`decode` round-trip, and a vocabulary you can read line by line.
 
-> 学习笔记 + 复现 spec。目标：复现完 [`bpe.py`](bpe.py) 后，能讲清
-> **「token 既不是词也不是字符，而是统计出来的高频片段」**，并解释那些奇怪现象（前导空格、数字被拆碎）。
+> **References** — Sennrich et al., *Neural Machine Translation of Rare Words with
+> Subword Units*, ACL 2016 ([arXiv:1508.07909](https://arxiv.org/abs/1508.07909)) ·
+> teaching implementation [karpathy/minbpe](https://github.com/karpathy/minbpe).
 
-## 一句话 mental model
+## Results (`python bpe.py`)
 
-从**字节/字符**开始，统计语料里**相邻出现最频繁的一对**，把它**合并**成一个新 token，
-记下这条合并规则；重复几千几万次，直到词表到目标大小。常见词被合成整块，罕见词留成碎片。
-**词表 = 一串有序的合并规则。**
+The same Taylor Swift article in both languages, ~60 KB each, trained to vocab 512:
 
-## 🎯 盯死的反直觉机制：分词是「学」出来的，不是规则切的
+| | English | Chinese 中文 |
+|---|---:|---:|
+| corpus | 60,853 chars / 60,940 bytes | 22,146 chars / 60,230 bytes |
+| bytes / char | 1.00 | 2.72 |
+| tokens @ vocab 512 | 28,386 | 29,449 |
+| compression (bytes/token) | **2.15×** | **2.05×** |
+| chars / token | 2.14 | 0.75 |
+| round-trip `decode(encode(x)) == x` | ✓ | ✓ |
+| `train_bpe_fast` == `train_bpe` | ✓ | ✓ |
+
+Same byte budget, same vocab — byte-level compression looks similar, but character-level efficiency diverges sharply. 
+
+**In other words, Chinese pays an early character-assembly cost: many merges are spent rebuilding UTF-8 bytes into characters. After that threshold, its short, repetitive words compress efficiently — enough to overtake English in bytes/token. (→ [English vs Chinese](#english-vs-chinese))**
+
+Round-trip is also exact on emoji, mixed-script, and empty inputs (the `sanity()` check).
+
+**The fast path matters more as the vocabulary grows** (English, naive vs fast):
+
+| vocab | tokens | bytes/token | naive | fast | speedup |
+|------:|-------:|------------:|------:|-----:|--------:|
+| 512   | 28,386 | 2.15× | 1.42s | 0.09s | **16×** |
+| 1024  | 21,231 | 2.87× | 4.01s | 0.11s | **37×** |
+| 2048  | 16,926 | 3.60× | 7.63s | 0.12s | **62×** |
+
+The naive cost grows with every merge; the fast path stays flat, so its advantage
+widens with both vocab size and corpus length.
+
+## What it learns
+
+Merges are learned **in frequency order** — the earliest are the most common byte
+pairs, and whole words assemble out of them later:
 
 ```
-训练（统计合并）:
-  语料: "low lower lowest ..."
-  初始: l o w   l o w e r   l o w e s t          (全是单字符)
-  最频繁对是 (l,o) → 合并成 "lo"
-  接着 (lo,w) → "low" ...                         每步并掉当前最高频对
-  → 学到一串 merges: [(l,o),(lo,w),...]
-
-编码（应用规则）:  对新文本，按 merges 的顺序反复合并 → token 序列
+rank   0  256  ' a'      rank   6  262  ' the'  = ' t' + 'he'
+rank   1  257  'he'      rank  13  269  ' and'  = ' a' + 'nd'
+rank   2  258  ' t'      ...
+rank   3  259  'in'      longest tokens by the end:
+rank   4  260  'on'        ' Billboard'  ' country'  ' Swift'  ' album'
+rank   5  261  'er'        ' Awards'  ' albums'  ' music'  ' artist'
 ```
 
-由此解释几个「怪现象」：
-- **token 常带前导空格**（如 `" the"`）：空格被并进词里，因为「空格+常见词」高频共现。
-- **数字 / 罕见词被拆碎**：它们没高频到能合成整块，只能留成更小的片段。
-- **同一个词在不同上下文 token 数可能不同**：取决于周围能触发哪些 merge。
-- **byte-level 兜底**：从 256 个字节起步，任何字符（emoji、生僻字）都能表示 → **永不 OOV**。
+Common strings collapse to a few tokens; rare ones stay in pieces; numbers never
+clump; spaces fuse onto the following word:
 
-## === DIFF: 三种分词粒度 ===
+```
+'Taylor Swift'  ->  ['T', 'aylor', ' Swift']     a frequent name
+' the album'    ->  [' the', ' album']           space merges INTO the word
+'re-recording'  ->  ['re', '-', 're', 'cord', 'ing']
+'1989'          ->  ['19', '8', '9']             digits never form long tokens
+'qwxz'          ->  ['q', 'w', 'x', 'z']         rare run -> raw bytes, never OOV
+```
 
-| | 按词 (word) | 按字符 (char) | BPE（折中） |
-|---|---|---|---|
-| 词表 | 巨大，且有 OOV | 极小，无 OOV | 中等，无 OOV（byte 兜底） |
-| 序列长度 | 短 | 很长 | 适中 |
-| 罕见词 | 整个变 `<unk>` | 逐字符 | 拆成已知片段 |
+## English vs Chinese
 
-## 你要复现的目标（接口 + TODO）
+Same article, same ~60 KB. The Chinese corpus
+([`data/taylorswift_zh.txt`](data/taylorswift_zh.txt)) is the same page from
+[zh.wikipedia](https://zh.wikipedia.org/wiki/泰勒·斯威夫特), almost identical in bytes
+(60,230 vs 60,940). But English is ASCII (**1.00 bytes/char**) while Chinese is CJK
+(**2.72 bytes/char**) — and byte-level BPE sees only raw bytes.
 
-文件：`bpe.py`（训练 + 编解码 + 演示）。
+| vocab | EN tokens | EN B/tok | EN ch/tok | ZH tokens | ZH B/tok | ZH ch/tok |
+|------:|----------:|---------:|----------:|----------:|---------:|----------:|
+| 512   | 28,386 | 2.15 | **2.14** | 29,449 | 2.05 | **0.75** |
+| 1024  | 21,231 | 2.87 | 2.87 | 20,661 | 2.92 | 1.07 |
+| 2048  | 16,926 | 3.60 | 3.60 | 15,140 | **3.98** | 1.46 |
+
+`bytes/token` is nearly identical — byte-level BPE is **script-agnostic on the byte
+axis**. The `chars/token` column exposes the hidden cost. Where do the 256 merges @512 go?
+
+| | multi-char words | single chars | byte fragments |
+|---|---:|---:|---:|
+| **English** | 255 | 0 | 1 |
+| **Chinese** | 29 | 118 | 109 |
+
+```
+first merges, EN:  ' a'  'he'  ' t'  'in'  'on'  'er'  ' the'  'ed'   -> straight to words
+first merges, ZH:  '�'  '�'  '�'  '�'  '，'  '�'  '的'  '�'           -> bytes into characters
+```
+
+- **English** is already one byte per char, so all 256 merges go straight to
+  words/subwords → **2.14 chars/token** immediately.
+- **Chinese** must first rebuild each character from its 3 bytes: **227 of 256 merges**
+  @512 are byte→char assembly (109 still mid-character `�`, 118 complete single chars),
+  leaving only **29** for real words (`斯威夫特` Taylor Swift, `公告牌` Billboard,
+  `专辑` album) — hence **< 1 char/token** at 512.
+- But Chinese words are short and repetitive, so once characters exist it catches up
+  fast and **overtakes English on bytes/token by vocab 2048** (3.98 vs 3.60).
+
+Takeaway: byte-level BPE pays a **character-assembly tax** on non-Latin scripts out of
+its early vocab budget — which is why multilingual production tokenizers use much
+larger vocabularies.
+
+## Files
+
+| file | what |
+|---|---|
+| [`bpe.py`](bpe.py) | tokenizer + training showcase (run it directly) |
+| [`data/`](data) | `taylorswift{,_zh}.txt` corpora (~60 KB each) + generated `.vocab` / `.model` |
+
+```bash
+python bpe.py    # sanity, train EN + ZH, write data/*.vocab / *.model, print the comparison
+```
+
+`data/` holds both the input corpora and the generated artifacts: `*.model` (the merges,
+reloadable) and `*.vocab` (every learned token in merge order, human-readable).
+
+## API
 
 ```python
-def train_bpe(corpus: str, vocab_size: int) -> list[tuple]:
-    # 返回有序 merges。循环：统计相邻对频次 → 合并最高频对 → 记录，直到词表达标
-def encode(text: str, merges) -> list[int]: ...
-def decode(ids: list[int], merges) -> str: ...
+merges = train_bpe(corpus, vocab_size)       # ordered dict[(int,int) -> int]
+merges = train_bpe_fast(corpus, vocab_size)  # identical result, much faster
+ids    = encode(text, merges)                # -> list[int]
+text   = decode(ids, merges)                 # -> str   (round-trips)
 ```
-建议 byte-level 起步（256 基础 token），保证无 OOV。
 
-## ⭐ 必做的 sanity
+Ties are broken explicitly — highest count, then **lexicographically smallest pair**
+(not dict insertion order). That determinism is what lets the heap-based
+`train_bpe_fast` reproduce the naive merges exactly.
 
-`bpe.py` 打印/断言：
-- **round-trip**：`decode(encode(s)) == s`，对任意输入（含 emoji）都成立；
-- 训练后展示**前几条学到的 merge**，和「常见词压成 1~2 个 token、随机串被拆很碎」的对比；
-- 词表增长曲线 / 不同文本的压缩率（token 数 / 字符数）。
+## naive vs fast
 
-## ✅ 盲讲检查点
-
-1. 一次 BPE 合并步在干嘛？「训练」和「编码」的区别？
-2. 为什么很多 token 带前导空格？为什么数字常被拆碎？
-3. byte-level 起步如何保证「永不 OOV」？
-4. 按词 / 按字符 / BPE 在词表大小、序列长度、罕见词处理上的权衡？
-5. 词表本质上是什么？（一串有序的合并规则）
-
-> LLM 主线收尾。回 [`../`](..) 总览，或转去 [`../../posttrain`](../../posttrain) 用 nano 当底座做后训练。
+`train_bpe` rescans every chunk each round — `O(merges · N)`. `train_bpe_fast` keeps a
+doubly-linked list over the bytes plus a lazy-deletion max-heap and only touches the
+pairs around each merged position, giving the 16–62× speedups above on identical output.

@@ -211,3 +211,6 @@ vit-patch2token/readme_zh.md
 # Paper-to-Code learning artifacts (MAE / VideoMAE / VL)
 */data/
 */out/
+
+# bpe demo corpus — fetched at runtime, not committed (glassbox「不带大数据集」)
+llm/bpe/taylorswift.txt
