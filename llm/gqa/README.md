@@ -1,72 +1,71 @@
 # llm/gqa — Grouped-Query Attention
 
-> **📌 一手出处 / official reference**
-> - 论文 *GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints* — Ainslie et al., EMNLP 2023 · [arXiv:2305.13245](https://arxiv.org/abs/2305.13245)
-> - 前身 MQA *Fast Transformer Decoding: One Write-Head is All You Need* — Shazeer, 2019 · [arXiv:1911.02150](https://arxiv.org/abs/1911.02150)
+Grouped-Query Attention keeps all `H` query heads but projects K and V to fewer heads,
+`H_kv < H`, with each K/V head shared by a group of `H/H_kv` query heads. The counter-intuitive
+part: this saves almost no training compute. Every query head still forms its own `[L, L]` score
+table, so the attention matmuls are unchanged — the only thing that shrinks is the K/V
+*projection*, a rounding error next to the FFN. What GQA actually buys is **inference**: the
+KV-cache stores `H_kv` heads instead of `H`, so it is `H/H_kv×` smaller, and autoregressive
+decode — which is bound by reading that cache out of HBM, not by FLOPs — has that much less to
+move each step. MHA is the `H_kv = H` end of the spectrum, MQA the `H_kv = 1` end; GQA sits in
+between. Llama 2 70B / Mistral / Qwen all use it.
 
-> 学习笔记 + 复现 spec。目标：复现完 [`gqa.py`](gqa.py) 后，能讲清
-> **「为什么 K/V 头比 Q 头少——而且动机在推理显存，不在训练算力」**。
-
-## 一句话 mental model
-
-标准 MHA：Q、K、V 各有 `H` 个头。GQA：Q 仍 `H` 个头，但 **K/V 只有 `H_kv` 个头**
-（`H_kv < H`），每个 K/V 头被 `H/H_kv` 个 Q 头**共享**。MQA 是极端情形 `H_kv = 1`。
-
-## 🎯 盯死的反直觉机制：砍 K/V 头是为了推理时的 KV-cache 显存
-
-直觉会以为「砍头是为省训练算力」。**不是。** 训练时 attention 仍是 `O(L²)`，砍 K/V 头省的算力很有限。
-真正的痛点在**推理**：自回归生成要把过去所有位置的 K、V 缓存在显存里（见 [`../kvcache`](../kvcache)），
-
-```
-KV-cache 大小  ∝  层数 × 序列长 × KV头数 × d_k
-```
-
-KV 头数从 `H` 砍到 `H_kv`，**cache 直接小 `H/H_kv` 倍** → 同样显存能塞更长上下文 / 更大 batch。
-而质量几乎不掉（论文实测 GQA 介于 MHA 和 MQA 之间，接近 MHA）。这是**纯推理工程驱动**的设计。
+> **References** — Ainslie et al., *GQA: Training Generalized Multi-Query Transformer Models from
+> Multi-Head Checkpoints*, EMNLP 2023 ([arXiv:2305.13245](https://arxiv.org/abs/2305.13245)) ·
+> predecessor MQA: Shazeer, *Fast Transformer Decoding: One Write-Head is All You Need*, 2019
+> ([arXiv:1911.02150](https://arxiv.org/abs/1911.02150)) · reference impl: `repeat_kv` in
+> [huggingface/transformers](https://github.com/huggingface/transformers).
 
 ```
-MHA  : H 个 Q 头 ↔ H 个 KV 头      （质量最好，cache 最大）
-GQA  : H 个 Q 头 ↔ H_kv 个 KV 头   （折中，主流选择）
-MQA  : H 个 Q 头 ↔ 1 个 KV 头       （cache 最小，质量略降）
+MHA:  wq, wk, wv : d → H·d_k       H query heads ↔ H kv heads
+GQA:  wq         : d → H·d_k       H query heads
+      wk, wv     : d → H_kv·d_k    H_kv kv heads, each shared by H/H_kv queries   ← the only change
+      scores : still H separate [L,L] tables  → no FLOP saving
+      cache  : only H_kv heads                → H/H_kv× smaller                   ← the whole point
 ```
 
-## === DIFF vs classic block ===
+The `H` query heads split into `H_kv` groups of `H/H_kv`; group `g` (the consecutive heads
+`g·n_rep … g·n_rep+n_rep−1`) all attend through K/V head `g`. There are two honest ways to run the
+attention given that head-count mismatch. **C — broadcast** (`forward_grouped`): reshape the query
+heads into their groups (`q.unflatten(1, (H_kv, n_rep))`) and give K/V a size-1 axis
+(`k.unsqueeze(2)`) so the shared head broadcasts across the group — no copy, but it still
+materializes the full `[B, H, L, L]` scores. **D — fused** (`forward`):
+`F.scaled_dot_product_attention(..., enable_gqa=True)` groups inside the kernel and tiles, so the
+`L×L` scores never reach HBM; it is the only path that removes the `O(L²)` term, and it falls back
+to C on torch < 2.5. (The textbook `repeat_kv` is just C with the broadcast copied out — same
+result, wasted memory — so it is not kept here.)
 
-| | MHA | GQA |
-|---|---|---|
-| wq 输出 | `H · d_k` | `H · d_k` |
-| wk / wv 输出 | `H · d_k` | **`H_kv · d_k`**（更小） |
-| 算 attention 前 | 直接用 | **把 K/V 沿头维 repeat `H/H_kv` 次**对齐到 H |
+## Experiment (`python gqa.py`)
 
-## 你要复现的目标（shape 契约 + TODO）
+The one asymmetry, in the shapes — `q` carries `H` heads, `k,v` stay at `H_kv`:
 
-文件：`gqa.py`（shape walk + cache 大小对比）。
-
-```python
-class GQA(nn.Module):
-    def __init__(self, d, n_heads, n_kv_heads):
-        assert n_heads % n_kv_heads == 0
-        self.wq = nn.Linear(d, n_heads    * d_k)
-        self.wk = nn.Linear(d, n_kv_heads * d_k)   # 更小
-        self.wv = nn.Linear(d, n_kv_heads * d_k)   # 更小
-    def forward(self, x, causal):
-        # q: [B, H, L, d_k];  k,v: [B, H_kv, L, d_k]
-        # k,v = repeat_kv(k, H//H_kv), repeat_kv(v, ...)  -> [B, H, L, d_k]
-        # 之后和标准注意力一样
 ```
-`repeat_kv`：把 K/V 在头维上每个头复制 `H/H_kv` 份。
+q    (2, 8, 16, 64)   H=8 heads
+k,v  (2, 2, 16, 64)   H_kv=2 heads
+out  (2, 16, 512)
+```
 
-## ⭐ 必做的 sanity
+The broadcast path and the fused kernel agree to the bit, and at `H_kv = H` GQA collapses back to
+plain MHA:
 
-`gqa.py` 打印：① shape walk，显式标出 `k,v` 在 `repeat_kv` 前是 `H_kv` 头、之后是 `H` 头；
-② **KV-cache 大小对比**：同 `(层数, L, d_k)` 下，断言 GQA/MQA 的 cache 比 MHA 小 `H/H_kv` / `H` 倍。
+```
+forward (SDPA enable_gqa) == forward_grouped (broadcast)
+H_kv = H degenerates to plain MHA
+```
 
-## ✅ 盲讲检查点
+Then price the KV-cache at 7B scale (32 layers, `L=8192`, `d_k=128`, bf16):
 
-1. GQA 里 Q、K、V 各几个头？谁共享谁？
-2. 砍 K/V 头主要省的是**训练算力**还是**推理显存**？为什么？
-3. KV-cache 大小正比于哪几个量？砍 KV 头怎么影响它？
-4. MHA / GQA / MQA 三者的连续谱，各自的 trade-off？
-5. `repeat_kv` 在哪一步、把什么对齐到什么？
+```
+        H_kv       cache    vs MHA
+MHA       32     4.00 GiB       1x
+GQA        8     1.00 GiB       4x
+MQA        1     0.12 GiB      32x
+```
 
-> 集齐 rope + rmsnorm + swiglu + gqa，进 [`../nano`](../nano) 组装；推理收益在 [`../kvcache`](../kvcache) 兑现。
+The cache shrinks by exactly `H/H_kv` — 4 GiB → 1 GiB moving from 32 KV heads to 8 — because it
+only ever stores `H_kv` heads. That number is GQA's entire reason to exist: not fewer FLOPs, just
+less to read back each decode step. The quality cost is small (the paper places GQA close to MHA
+and well above MQA), which is why 8 KV heads is a common production pick.
+
+> Next: assemble with rope + rmsnorm + swiglu in [`../nano`](../nano); the inference payoff is
+> realized in [`../kvcache`](../kvcache).

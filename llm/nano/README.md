@@ -1,72 +1,73 @@
-# llm/nano — 组装一个 decoder-only mini-Llama
+# llm/nano — a decoder-only mini-Llama
 
-> **📌 一手出处 / official reference**
-> - 论文 *LLaMA: Open and Efficient Foundation Language Models* — Touvron et al., 2023 · [arXiv:2302.13971](https://arxiv.org/abs/2302.13971)
-> - 架构源头 *Attention Is All You Need* — Vaswani et al., 2017 · [arXiv:1706.03762](https://arxiv.org/abs/1706.03762)
-> - 教学级参考实现 [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT)、[meta-llama/llama](https://github.com/meta-llama/llama)
+`nano` is where the four mechanisms stop being isolated parts and become a model. The modern
+decoder block is two **pre-norm residuals** — `x = x + GQA(RMSNorm(x))` then
+`x = x + SwiGLU(RMSNorm(x))`, with RoPE rotating Q/K inside the attention. Stack `N` of these
+between a token embedding and a tied LM head and you have a decoder-only language model: the
+Llama architecture, minus scale. The counter-intuitive part is how little the assembly adds —
+every piece was already written and unit-tested on its own, so `nano` is mostly wiring, plus the
+two things that only exist at the model level: the residual stream and next-token training.
+Llama / Qwen / Mistral are all this block, wider and deeper.
 
-> 学习笔记 + 复现 spec。目标：复现完 [`nano.py`](nano.py) 后，能讲清
-> **「rope + rmsnorm + swiglu + gqa 怎么拼成一个能 train、能生成的现代 block」**，
-> 并产出本主线的「现代积木」参考实现（类比旧 repo 的 `common.py`）。
-
-## 一句话 mental model
-
-把前四个组件按 **pre-norm 残差**拼成一个 modern block，堆 N 层，前面接 token embedding、
-后面接一个 LM head，就是一个 decoder-only 语言模型。用 **next-token（teacher forcing）**
-在一小段文本上训练，证明它能学会续写。
-
-## modern block 长这样（== 四件套各就各位 ==）
+> **References** — Touvron et al., *LLaMA: Open and Efficient Foundation Language Models*, 2023
+> ([arXiv:2302.13971](https://arxiv.org/abs/2302.13971)) · architecture from Vaswani et al.,
+> *Attention Is All You Need*, 2017 ([arXiv:1706.03762](https://arxiv.org/abs/1706.03762)) ·
+> reference impls: [karpathy/nanoGPT](https://github.com/karpathy/nanoGPT),
+> [meta-llama/llama](https://github.com/meta-llama/llama).
 
 ```
-x = x + GQA( RMSNorm(x),  rope=on,  causal=True )   # rope 在 GQA 内部对 Q/K 施加
-x = x + SwiGLU( RMSNorm(x) )                         # 门控 FFN
-```
-对比旧 `common.py` 的 classic block：`LayerNorm→MHA`、`LayerNorm→GELU-MLP`、位置靠外部加。
-**四处零件全换了**，残差结构没变。
-
-## 🎯 这个组件要盯死的：next-token 训练到底在干嘛
-
-```
-输入  tokens:  [BOS]  the   cat   sat
-标签(右移一位): the    cat   sat   [EOS]
-                每个位置预测「下一个 token」，所有位置一次并行算（teacher forcing）
-loss = CrossEntropy(logits[:, :-1], labels[:, 1:])   # 经典的 shift-by-one
+NanoLLM =
+  token embedding
+  → N × [ x = x + GQA( RMSNorm(x), RoPE, causal )   # causal self-attention — the decoder-only part
+          x = x + SwiGLU( RMSNorm(x) ) ]            # two pre-norm residuals per block
+  → final RMSNorm
+  → tied LM head
+  → next-token loss
 ```
 
-反直觉点：训练时**所有位置同时**算 loss（causal mask 保证第 t 位看不到未来），一次 forward
-就拿到整条序列每一步的监督信号——这和推理时**一个一个吐**（见 [`../kvcache`](../kvcache)）形成鲜明对照。
+Compared with the classic Transformer block the residual shape is unchanged; the swapped parts
+are MHA→GQA, LayerNorm→RMSNorm, GELU-MLP→SwiGLU, and absolute-PE→RoPE. Three wiring facts carry
+the rest. **Pre-norm**: each sub-layer normalizes a *copy* of the stream and adds the result back
+to the un-normalized `x`, so the residual highway runs clean from embedding to head — which is
+exactly why a final `RMSNorm` is needed before the LM head. **RoPE lives inside attention**:
+`build_rope_cache` runs once at construction (sized by `d_k` and `max_len`), and the same
+`cos`/`sin`, sliced to the current length, feed every layer — the rotation hits Q and K *after*
+the head split, never the residual stream. **Decoder-only is the causal mask**: GQA runs with
+`causal=True`, so position `t` attends only to `≤ t` — flip it to `False` and the same block is a
+bidirectional encoder. That one constraint, plus next-token teacher forcing (a single forward
+scores every position at once, `loss = CrossEntropy(logits[:, :-1], ids[:, 1:])`) and a
+weight-tied LM head (`lm_head.weight = embed.weight`, one shared `[vocab, d]` Parameter), is what
+makes this a generative decoder rather than an encoder.
 
-**weight tying**：token embedding 矩阵和 LM head 的输出矩阵**共享同一份权重**（省参数、且有道理：
-「把向量映射回词表」和「把词表映射成向量」本就是一对互逆操作）。
+Unlike the single-file reference, this `nano.py` **imports the real component files**: a two-line
+path shim puts `llm/` on `sys.path`, then `from rope.rope import build_rope_cache`,
+`from gqa.gqa import GQA`, and so on. The components stop being throwaway exercises and become the
+engine — a fix in `rope.py` propagates here, and the same `NanoLLM` is later reused by the scaled
+experiment instead of being rewritten.
 
-## 你要复现的目标（shape 契约 + TODO）
+## Experiment (`python nano.py`)
 
-文件：`nano.py`（shape walk）、`train_sanity.py`（训练验证）。
+A 2-layer `d=64` model (92K params) trained 300 steps on a char-level description of its own
+architecture:
 
-```python
-class ModernBlock(nn.Module):     # RMSNorm + GQA(rope, causal) + RMSNorm + SwiGLU，pre-norm 残差
-class NanoLLM(nn.Module):
-    # embed: nn.Embedding(vocab, d)
-    # blocks: N × ModernBlock
-    # norm:  RMSNorm(d)
-    # lm_head: Linear(d, vocab, bias=False)，weight 与 embed 共享（tying）
-    def forward(self, ids):       # [B, L] -> logits [B, L, vocab]
 ```
-shape walk：`ids [B,L] → embed [B,L,d] → N blocks → norm → logits [B,L,vocab]`。
+vocab 26  params 91,840
+shape  ids (1, 8) --NanoLLM--> logits (1, 8, 26)
+step    0  loss 3.280
+step   50  loss 0.352
+step  150  loss 0.062
+step  299  loss 0.051
 
-## ⭐ 必做的 sanity（train_sanity.py）
+greedy from 'rope rot':
+rope rotates the queries and keys. rmsnorm rescales the stream. swiglu gates the feed forward. gqa shares the kv heads. stack th
+```
 
-在一小段文本（char-level 或 tiny vocab）上 next-token 训练几百步：
-- 断言 loss 显著下降（如后 20 步均值 < 前 20 步 × 0.9）；
-- 用贪心解码打印一段生成样本，肉眼可见它学到了语料的模式（能背出/续写）。
+The loss starts at `ln(26) ≈ 3.26` — the entropy of a uniform guess over 26 characters — and
+falls to `~0.05` as the model memorizes the text, after which greedy decoding recites it back.
+This is memorization on purpose, not generalization: on a few hundred characters the only claim
+being proved is that the assembled pipeline trains and generates end-to-end. It is also the first
+time the four hand-written components, composed through imports, run together as one model.
 
-## ✅ 盲讲检查点
-
-1. modern block 的两条残差分别是什么？四件套各在哪一步？
-2. next-token 训练怎么造标签？为什么能「所有位置并行算 loss」？（causal mask + teacher forcing）
-3. weight tying 把哪两个矩阵绑一起？为什么合理？
-4. 训练（并行）和推理（自回归逐 token）的根本不对称在哪？
-5. causal mask 在这里是必须的吗？去掉会怎样？（会偷看未来，训练作弊）
-
-> 推理 + 采样在 [`../kvcache`](../kvcache)；想加稀疏 FFN 去 [`../moe`](../moe)；这个 mini-Llama 也是
-> [`../../posttrain`](../../posttrain) 整条后训练线的底座。
+> Next: cache the decode and sample in [`../kvcache`](../kvcache); swap the FFN for a sparse one
+> in [`../moe`](../moe); this mini-Llama is also the base for the whole
+> [`../../posttrain`](../../posttrain) line.

@@ -6,6 +6,7 @@
 
 > 学习笔记 + 复现 spec。目标：复现完 [`vl.py`](vl.py) 后，能讲清
 > **视觉 token 如何拼进 LLM 序列、projector 的角色**。这是 CV 线接 [`../../llm`](../../llm) 的桥。
+> 复习时：先做文末盲讲检查点，全答上来就直接跑代码。
 
 ## 一句话 mental model
 
@@ -13,7 +14,10 @@
 把这些视觉向量**塞进文本序列里 `<image>` 占位符的位置** → LLM 拿到一条 `[文本|视觉|文本]` 的混合
 序列，做**普通 causal self-attention**，根本不区分哪些位置来自像素、哪些来自单词。
 
-## 🎯 盯死的反直觉机制：projector 就是「图像的 embedding 层」
+## 🎯 先猜：LLM 怎么区分序列里哪些 token 来自图、哪些来自文字？（想 30 秒）
+
+**答案：它根本不区分。projector 把视觉单位变成 `d_llm` 向量后，和文本 token 一视同仁做 causal
+attention。projector 扮演的就是「图像的 embedding 层」。**
 
 ```
 文本:  token id        ──nn.Embedding──►  d_llm 向量
@@ -70,15 +74,30 @@ class VLModel(nn.Module):
         return emb
 ```
 
+splice 那行的隐藏前提（写错就静默错位）：`ids == IMG_TOKEN` 的布尔 mask 按**行优先**展平，
+`vis.reshape(-1, d_llm)` 也按 batch×n_img 行优先展平——两边顺序必须一致，且
+**占位符个数 == 视觉 token 数**（每张图 n_img 个，整个 batch 共 `B·n_img` 个 IMG）。
+先写一条断言把这两个数卡死，再训练。
+
+## 🪜 实现阶梯（每级跑通断言再上一级）
+
+1. **冻结 ViT + projector 出视觉 token**：断言 `vis` 是 `[B,n_img,d_llm]`，且
+   `vision` 的参数 `requires_grad=False`（冻结真的生效了）。
+2. **splice**：断言 IMG 占位符个数 == `B·n_img`；splice 后非 IMG 位置的 embedding 和
+   `tok_embed(ids)` 逐元素相等（只覆盖了该覆盖的位置）。
+3. **端到端 forward + 训练**：跑 ⭐，颜色准确率 → 1.0。
+4. **可微性反证**（机制的直接证据）：把 projector 的梯度 detach 掉再训一次 → 准确率卡在
+   chance。证明「颜色信息只能沿 LM→视觉 token→projector 这条路回传」。
+
 ## ⭐ 必做的 sanity
 
 `train_sanity.py`：训 ~400 步，颜色准确率 →1.0，存 `predictions.png`。
 
 ## ✅ 盲讲检查点
 
-1. projector 的作用用一句话类比？（图像的 embedding 层 = 文本 token-embedding 的对应物）
+1. projector 的作用用一句话类比？
 2. 视觉向量怎么「进入」序列？维度为什么必须是 `d_llm`？
-3. LLM 怎么区分视觉 token 和文本 token？（**不区分**，统一 causal attention）
+3. LLM 怎么区分视觉 token 和文本 token？
 4. 为什么这个 toy 必须靠图像才能答对颜色？
 5. 真实 LLaVA 两阶段分别冻结/训练什么？本 toy 哪里不同、为什么？
 6. 和 [`../clip`](../clip) 的「对比对齐」相比，这条路线打通图文的方式有何本质不同？

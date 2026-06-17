@@ -214,3 +214,15 @@ vit-patch2token/readme_zh.md
 
 # bpe demo corpus — fetched at runtime, not committed (glassbox「不带大数据集」)
 llm/bpe/taylorswift.txt
+
+# glassbox: unimplemented components (spec README only, no .py yet) — held back until
+# reproduced. Delete the matching line when a component's .py lands. NOTE: only works on
+# not-yet-tracked dirs; kvcache/moe/cv-tracked/posttrain are already committed and unaffected.
+llm/localattn/
+llm/mla/
+llm/specdec/
+cv/framesample/
+cv/mrope/
+cv/siglip/
+cv/tokbudget/
+cv/tokmerge/

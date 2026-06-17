@@ -25,13 +25,22 @@ x = x + FFN(LayerNorm(x))          # FFN = Linear → GELU → Linear（2 个矩
 | 7 | [`moe/`](moe) | FFN（进阶） | 每 token 只**路由**到 top-k 个 expert → 参数涨但单 token FLOPs 几乎不变 |
 | 8 | [`bpe/`](bpe) | 输入（独立） | 不按词不按字符，**统计高频字节对反复合并**；解释 token 为什么带前导空格 |
 
+### 2025 推理效率支线（全部以 kvcache 完成为前提）
+
+| # | 组件 | 换掉的零件 | 盯死的反直觉机制 |
+|---|---|---|---|
+| 9 | [`mla/`](mla) | 多头注意力（进阶） | cache 里存的**既不是 K 也不是 V**，是低秩 latent；RoPE 与矩阵吸收冲突，逼出 decoupled 子空间 |
+| 10 | [`localattn/`](localattn) | attention mask（进阶） | 大多数层只看最近 W 个，感受野靠深度叠回来；streaming 时**开头 token 删不得**（sink）|
+| 11 | [`specdec/`](specdec) | —（推理，进阶） | 小模型打草稿、大模型**一次 forward 并行验收**；rejection sampling 保证分布与 target 逐 token 一致 |
+
 ## 复现顺序
 
 ```
 rope ─┐
 rmsnorm ─┼─► nano(组装+训练) ─► kvcache(推理生成) ─► moe / bpe（进阶，任选）
-swiglu ─┤
-gqa ─────┘
+swiglu ─┤                          │
+gqa ─────┘                         └─► mla ─► localattn ─► specdec（2025 支线）
 ```
 
 1–4 互相独立、可任意顺序，但都建议先各自单文件验证（shape walk + 一个 sanity 断言）再进 `nano/` 组装。
+9–11 必须排在 kvcache 之后：mla 的等价测试、specdec 的 `n_new` 验证步都直接吃 kvcache 的 `decode_step` 接口。

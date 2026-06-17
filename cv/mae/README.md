@@ -6,6 +6,7 @@
 
 > 学习笔记 + 复现 spec。目标：复现完 [`mae.py`](mae.py) 后，能对着代码盲讲
 > **非对称 encoder–decoder + masking 的数据流**。
+> 复习时：先做文末盲讲检查点，全答上来就直接跑代码。
 
 ## 一句话 mental model
 
@@ -13,7 +14,10 @@
 把扔掉的部分**画回来** → **只在被扔的 patch 上**算重建 MSE。预训练完，encoder 就是通用视觉特征
 提取器（下游把 decoder 扔掉）。本质是 BERT 完形填空搬到图像，但有一个图像独有的转折。
 
-## 🎯 盯死的反直觉机制：非对称 (asymmetric) encoder–decoder
+## 🎯 先猜：那个又深又贵的 encoder，要不要处理被遮掉的 75% patch？（想 30 秒）
+
+**答案：完全不碰——encoder 只吃 25% 可见 patch，mask token 要到浅 decoder 才出现。**
+这就是「非对称 (asymmetric) encoder–decoder」，也是标题里 "scalable" 的来源。
 
 ```
         25% 可见 patch ──►  ENCODER (深,宽) ──► latent
@@ -43,6 +47,18 @@
 | + decoder 位置 → decoder → 预测像素 | `[B,64,48]` | |
 | loss | 标量 | **只在被遮的 patch 上**算 MSE |
 
+## 🪜 实现阶梯（每级跑通断言再上一级）
+
+1. **shuffle/gather masking 单独写、单独测**——这是全组件最容易错的一步，先隔离它：
+   `random_masking(x, ratio)` 返回 `(x_kept, mask, ids_restore)`。断言
+   `gather(scatter回去, ids_restore)` 能还原原始顺序；mask 里 1 的个数 == 被遮数。
+2. **encoder 只吃可见**：断言 encoder 输入序列长度 == `len_keep`（16），不是 64——这条断言
+   直接证明「非对称」落地了。
+3. **补 mask token + ids_restore 还原 + decoder**：断言 decoder 输出回到 `[B,64,48]`。
+4. **masked-only loss + 训练**：跑 ⭐。先预测起步 loss（归一化像素的 MSE，量级约多少？）。
+   再加一条对照：在**可见 patch** 上也算 loss，会发现它几乎为 0（模型在抄自己的输入）——
+   反证「loss 只在 masked patch 上算」的必要性。
+
 ## ⭐ 必做的 sanity
 
 `train_sanity.py`：CIFAR 训 ~400 步，断言「后 20 步均值 loss < 前 20 步 × 0.9」，存
@@ -50,10 +66,10 @@
 
 ## ✅ 盲讲检查点
 
-1. encoder 输入序列长度是多少？（`len_keep`）mask token 在哪一步才出现？（decoder）
+1. encoder 输入序列长度是多少？mask token 在哪一步才出现？
 2. 位置编码为什么在 masking **之前**加？
-3. `ids_restore` 是什么、用来干嘛？（逆排列；decoder 端还原顺序）
-4. loss 为什么只在 masked patch 上算？（算可见 patch 是作弊）
-5. 省算力的根本原因？（`O(L²)` + 把 3/4 token 移给浅 decoder）
+3. `ids_restore` 是什么、用来干嘛？怎么从 `ids_shuffle` 得到它？
+4. loss 为什么只在 masked patch 上算？在可见 patch 上算会怎样？
+5. 省算力的根本原因？为什么遮 75% 而 BERT 只遮 15%？
 
 > 下一站 [`../videomae`](../videomae)：同一骨架，只改 3 处就变视频版。

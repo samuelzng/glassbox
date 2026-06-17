@@ -6,6 +6,7 @@
 
 > 学习笔记 + 复现 spec。目标：复现完 [`moe.py`](moe.py) 后，能讲清
 > **「为什么参数量能涨 N 倍，而每个 token 的算力几乎不变」**，以及 load-balance loss 防的是什么。
+> 复习时：先做文末盲讲检查点，全答上来就直接跑代码。
 
 ## 一句话 mental model
 
@@ -13,7 +14,9 @@
 **top-k 个** expert（通常 k=1 或 2）去算，其余 expert 这个 token 完全不碰。输出 = 被选中
 expert 输出的加权和。**容量（参数）和算力（FLOPs）从此解耦。**
 
-## 🎯 盯死的反直觉机制：参数↑ 但单 token FLOPs≈不变
+## 🎯 先猜：8 个 expert、top-2，总参数是 dense FFN 的几倍？单 token FLOPs 呢？（想 30 秒）
+
+**答案：参数 ≈ ×8，FLOPs 只 ≈ ×2——容量随 N 涨，计算只随 k 涨。**
 
 ```
               ┌─ expert 1 (SwiGLU) ─┐
@@ -27,10 +30,25 @@ expert 输出的加权和。**容量（参数）和算力（FLOPs）从此解耦
 直觉里「更多参数 = 更多计算」，MoE 打破了它：**总参数随 N 线性涨，单 token 计算只随 k 涨**。
 这就是 Mixtral-8x7B「8 个专家、每 token 只激活 2 个」能用接近 13B 的算力跑出 ~47B 容量的原因。
 
-## 🎯 反直觉机制 2：必须有 load-balance 辅助 loss
+## 🎯 先猜：只用主任务 loss 训练，router 会学成什么样？
 
-只用主任务 loss 训练，router 会**塌缩**：所有 token 都涌向少数几个 expert（赢家通吃），
-其余 expert 饿死、白占参数。所以加一个**辅助 loss** 惩罚「分配不均」，逼 token 大致均匀散到各 expert。
+**答案：塌缩——所有 token 涌向少数几个 expert（赢家通吃），其余 expert 饿死、白占参数。**
+被选中的 expert 训得更好 → 下次得分更高 → 更常被选中，正反馈一旦启动就锁死。
+所以必须加一个**辅助 loss** 惩罚「分配不均」，逼 token 大致均匀散到各 expert。
+
+### 辅助 loss 的公式（Switch Transformer §2.2，照这个写）
+
+对一个 batch 的全部 token、N 个 expert：
+
+```
+f_i   = 被路由到 expert i 的 token 占比     （硬计数，不可导）
+P_i   = router 给 expert i 的 softmax 概率在全 batch 上的均值（可导）
+L_aux = α · N · Σᵢ f_i · P_i                （α ≈ 0.01；总 loss = CE + L_aux）
+```
+
+两边都均匀时 `Σ fᵢPᵢ = N·(1/N)(1/N) = 1/N`，乘 N 后 L_aux = α（最小值附近）；全塌到一个
+expert 时 ≈ α·N。梯度全部从可导的 P 流回 router，硬计数 f 只负责给「谁超载」配权重。
+（Switch 按 top-1 定义 f；k>1 时把「被路由到」理解为进入该 token 的 top-k，f 除以 k·T 归一。）
 
 ## === DIFF vs classic / swiglu FFN ===
 
@@ -57,6 +75,30 @@ class MoE(nn.Module):
         # 同时返回 load-balance aux loss
 ```
 
+路由的写法——**先写慢的、对的**，教学版循环 expert 即可，不做 dispatch 优化：
+
+```python
+gate = softmax(router(x), dim=-1)            # [B,L,N]
+w, idx = gate.topk(k, dim=-1)                # 各 [B,L,k]
+w = w / w.sum(-1, keepdim=True)              # top-k 内重归一化（Mixtral 做法）
+out = zeros_like(x)
+for e in range(N):                           # 循环 expert，不循环 token
+    sel = (idx == e)                         # [B,L,k] 哪些 token 的第几名选了 e
+    tok = sel.any(-1)                        # [B,L] 布尔掩码
+    out[tok] += w[sel][:, None] * experts[e](x[tok])   # 该 expert 一次算完它的 token
+```
+
+aux loss 在同一个 forward 里顺手算（f 从 `idx` 计数，P 从 `gate` 取均值）。
+
+## 🪜 实现阶梯（每级跑通断言再上一级）
+
+1. **router + top-k 选择**（先不接 expert）：断言每个 token 恰好选中 k 个、权重和为 1。
+2. **接上 N 个 SwiGLU expert**：断言输出 shape == 输入 shape；N=1, k=1 时输出 ==
+   单个 SwiGLU 直接算（MoE 退化为 dense 的等价性）。
+3. **aux loss**：手算一个 2 expert、4 token 的小例子核对公式，再断言均匀路由时 ≈ α。
+4. **塌缩实验**（⭐ 的直方图）：同任务同初始化，加 / 不加 aux loss 各训几十步，对比使用率。
+   跑之前先预测：不加的那组，8 个 expert 大概几个存活？
+
 ## ⭐ 必做的 sanity
 
 `moe.py` / `train_sanity.py`：
@@ -68,8 +110,9 @@ class MoE(nn.Module):
 
 1. 为什么总参数随 N 涨、但单 token FLOPs 只随 k 涨？容量和算力怎么解耦的？
 2. router 输出什么？top-k 是在挑什么？
-3. 不加 load-balance loss 会发生什么？（router 塌缩 / 赢家通吃）辅助 loss 防的就是它。
-4. Mixtral「8x7B 激活 2 个」是什么意思？为什么算力≈13B 而非 47B？
-5. expert 内部用什么结构？（通常就是 [`../swiglu`](../swiglu)）
+3. 不加 load-balance loss 会发生什么？为什么是正反馈锁死？
+4. aux loss 公式里 f 和 P 各是什么？为什么梯度只能从 P 走？
+5. Mixtral「8x7B 激活 2 个」是什么意思？为什么算力≈13B 而非 47B？
+6. expert 内部通常用什么结构？
 
 > 进阶组件，做完可回 [`../`](..) 或转 [`../bpe`](../bpe)。
