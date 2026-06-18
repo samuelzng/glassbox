@@ -11,24 +11,28 @@ from swiglu.swiglu import SwiGLU
 from gqa.gqa import GQA                       
 
 class ModernBlock(nn.Module):
-    def __init__(self, d, n_heads, n_kv_heads):
+    def __init__(self, d, n_heads, n_kv_heads, ffn_factory=None):
         super().__init__()
         self.att_norm = RMSNorm(d)
         self.att = GQA(d, n_heads, n_kv_heads)
         self.ffn_norm = RMSNorm(d)
-        self.ffn = SwiGLU(d)
+        self.ffn = (ffn_factory or (lambda dim: SwiGLU(dim)))(d)
 
     def forward(self, x, cos, sin):
         x = x + self.att(self.att_norm(x), cos, sin)
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
+        out = self.ffn(self.ffn_norm(x))
+        if isinstance(out, tuple):              # MoE -> (out, aux, idx); SwiGLU -> tensor
+            out, self.aux, self.idx = out
+        else:
+            self.aux, self.idx = None, None
+        return x + out
     
 
 class NanoLLM(nn.Module):
-    def __init__(self, vocab, d, n_layers, n_heads, n_kv_heads, max_len):
+    def __init__(self, vocab, d, n_layers, n_heads, n_kv_heads, max_len, ffn_factory=None):
         super().__init__()
         self.embed = nn.Embedding(vocab, d)
-        self.blocks = nn.ModuleList(ModernBlock(d, n_heads, n_kv_heads) for _ in range(n_layers))
+        self.blocks = nn.ModuleList(ModernBlock(d, n_heads, n_kv_heads, ffn_factory) for _ in range(n_layers))
         self.norm = RMSNorm(d)
         self.lm_head = nn.Linear(d, vocab, bias=False)
         self.lm_head.weight = self.embed.weight   
@@ -43,6 +47,8 @@ class NanoLLM(nn.Module):
         x = self.embed(ids)
         for block in self.blocks:
             x = block(x, self.cos[:L], self.sin[:L])
+        self.aux = sum((b.aux for b in self.blocks if b.aux is not None), 0)  # scalar; 0 if dense
+        self.routing = [b.idx for b in self.blocks if b.idx is not None]      # per-MoE-layer expert ids
         return self.lm_head(self.norm(x))
 
 

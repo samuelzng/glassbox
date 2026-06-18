@@ -1,46 +1,112 @@
-# 主线 1 · 现代 LLM 架构
+# llm — rebuilding a modern decoder, one mechanism at a time
 
-> 一个 2024 的 decoder-only LLM（Llama / Qwen 系），相对 2017 的原版 Transformer，**到底改了哪几块**。
-> 每个组件单独拎出来一个机制，最后 `nano/` 把它们拼成一个能 train、能生成的 mini-Llama。
+`llm/` rebuilds the mechanisms behind a modern decoder-only LLM (Llama / Qwen lineage) from their
+source papers — not to compete with them, but to make each design choice **executable**: isolate the
+mechanism, prove its signature property in one runnable file, assemble the parts into a trainable
+mini-Llama, then use sparse routing as the capstone experiment.
 
-## 起点：classic pre-norm block（你已经会的）
+Assembled and trained on a laptop GPU, it wrote this:
 
-```
-x = x + MHA(LayerNorm(x))          # 全量多头注意力，位置靠外部 absolute/learned PE 加一次
-x = x + FFN(LayerNorm(x))          # FFN = Linear → GELU → Linear（2 个矩阵）
-```
+![One 19M-parameter character model — two registers, one prompt each](nano/data/samples_panel.png)
 
-下面每个组件就是把这块里的**一个零件**换成现代版，README 里用 `=== DIFF vs classic block ===` 标出来。
+It runs at **character level** — one token per character, ~8,300 of them, no word vocabulary — which
+makes the feat precise: the model captures each distribution's *register* (ML-abstract cadence;
+five/seven-character rhythm, even the 楚辞 particle **兮**) without its meaning. Below: how it's
+built, and what it reveals about how it spends its compute.
 
-## 组件表
-
-| # | 组件 | 换掉的零件 | 盯死的反直觉机制 |
-|---|---|---|---|
-| 1 | [`rope/`](rope) | 位置编码 | 位置不再「加」一个向量，而是把 Q/K **旋转**；点积只依赖**相对**位置差，每层都重施 |
-| 2 | [`rmsnorm/`](rmsnorm) | LayerNorm | 扔掉**减均值**和 bias，只按 RMS 缩放——centering 居然可省 |
-| 3 | [`swiglu/`](swiglu) | FFN | 2 矩阵→3 矩阵 + **门控**，hidden 维 ×⅔ 保参数量 |
-| 4 | [`gqa/`](gqa) | 多头注意力 | K/V head 数 < Q head 数、分组共享。砍它**不为省训练算力，为推理 KV-cache 显存** |
-| 5 | [`nano/`](nano) | —（组装） | 把 1–4 拼成 decoder-only mini-Llama，next-token 训练，证明能生成 |
-| 6 | [`kvcache/`](kvcache) | —（推理） | 训练**并行**算全序列；推理**自回归**缓存过去 K/V，每步 `O(L²)→O(L)`；输出靠 sampler |
-| 7 | [`moe/`](moe) | FFN（进阶） | 每 token 只**路由**到 top-k 个 expert → 参数涨但单 token FLOPs 几乎不变 |
-| 8 | [`bpe/`](bpe) | 输入（独立） | 不按词不按字符，**统计高频字节对反复合并**；解释 token 为什么带前导空格 |
-
-### 2025 推理效率支线（全部以 kvcache 完成为前提）
-
-| # | 组件 | 换掉的零件 | 盯死的反直觉机制 |
-|---|---|---|---|
-| 9 | [`mla/`](mla) | 多头注意力（进阶） | cache 里存的**既不是 K 也不是 V**，是低秩 latent；RoPE 与矩阵吸收冲突，逼出 decoupled 子空间 |
-| 10 | [`localattn/`](localattn) | attention mask（进阶） | 大多数层只看最近 W 个，感受野靠深度叠回来；streaming 时**开头 token 删不得**（sink）|
-| 11 | [`specdec/`](specdec) | —（推理，进阶） | 小模型打草稿、大模型**一次 forward 并行验收**；rejection sampling 保证分布与 target 逐 token 一致 |
-
-## 复现顺序
+## Architecture — from the 2017 block to a modern decoder
 
 ```
-rope ─┐
-rmsnorm ─┼─► nano(组装+训练) ─► kvcache(推理生成) ─► moe / bpe（进阶，任选）
-swiglu ─┤                          │
-gqa ─────┘                         └─► mla ─► localattn ─► specdec（2025 支线）
+x = x + MHA(LayerNorm(x))      # 2017: full attention + absolute PE
+x = x + FFN(LayerNorm(x))      #       FFN = Linear → GELU → Linear
 ```
 
-1–4 互相独立、可任意顺序，但都建议先各自单文件验证（shape walk + 一个 sanity 断言）再进 `nano/` 组装。
-9–11 必须排在 kvcache 之后：mla 的等价测试、specdec 的 `n_new` 验证步都直接吃 kvcache 的 `decode_step` 接口。
+| component | replaces | core mechanism |
+|---|---|---|
+| [rope](rope) | absolute PE | rotate Q/K → the dot product sees only the *relative* offset, every layer |
+| [rmsnorm](rmsnorm) | LayerNorm | drop centering and bias; RMS scaling alone suffices |
+| [swiglu](swiglu) | FFN | two matrices → three with a gate; hidden ×⅔ to hold the parameter count |
+| [gqa](gqa) | multi-head attn | fewer KV heads than Q heads — for *inference* cache memory, not training FLOPs |
+| [bpe](bpe) | tokenizer | merge frequent byte-pairs, not words/chars → why a token carries its leading space |
+| [nano](nano) | (assembly) | the four, wired: pre-norm stream, RoPE inside attention, tied head, next-token loss |
+| [kvcache](kvcache) · *in progress* | (inference) | decoding caches past K/V → each step O(L), not O(L²) |
+| mla · *in progress* | attention | cache a low-rank latent, not K/V; RoPE forces a decoupled subspace |
+| localattn · *in progress* | attention mask | each layer sees the last W tokens; depth restores reach; sinks stay |
+| specdec · *in progress* | (inference) | draft small, verify big in one forward; rejection sampling keeps the output distribution exact |
+
+Each folder is one standalone file whose output proves the mechanism. Assembled, `nano` trains
+end-to-end (loss 3.28 → 0.05) and greedy-decodes a description of its own architecture.
+
+## Tokenization — the same allocation problem, before training
+
+The capstone stays character-level on purpose: one character, one token, so the MoE experiment
+isolates *routing*, not tokenizer effects. The byte-level [`bpe`](bpe) is tested separately on the
+same two corpora, and it surfaces the same tension a layer earlier. It round-trips both exactly
+(byte-level BPE is lossless), but under one **shared merge budget** the scripts don't benefit
+equally: at vocab 2048, English reaches **3.26 chars/token** while Chinese stays **below 1.0 (0.86)**
+— most hanzi still span several byte-fragment tokens, and a fifth of the learned vocabulary is
+partial-character fragments. Dedicating the budget to Chinese roughly **doubles** hanzi-as-token
+coverage, at English's expense. Frequency-based allocation favors the cheaper distribution — the
+MoE's balance↔specialization, before training even starts.
+
+## Capstone — but what is the MoE actually for?
+
+The striking generation above is **not** the Mixture-of-Experts' doing — and proving that is the
+point. We swap `nano`'s SwiGLU for a Switch-MoE (8 experts/layer, **top-1** routing) and keep the
+dense `nano` as the control: same per-token compute, 4× the capacity.
+
+```
+model        params   ce     arxiv max/live   gushi max/live   aux
+dense        4.87M    2.61    —                —               —
+MoE β=0      19.5M    2.62    39% / 6-of-8     34% / 6-of-8    7.5
+MoE β=0.001  19.5M    2.57    19% / 8-of-8     27% / 8-of-8    4.6
+MoE β=0.01   19.5M    2.84    23% / 7-of-8     24% / 7-of-8    4.0
+```
+
+The control makes the loss story hard to overstate: **the 4× total capacity does not translate into a
+clear loss improvement** (2.57 vs 2.61, single-seed), and the dense model generates both scripts just
+as fluently. So the dual samples above are *character
+modeling*, not routing. The MoE's **one exclusive result** is *how it allocates* — and that is the
+interesting one. β (the load-balance weight in `loss = CE + β·aux`) exposes two coupled effects:
+
+- **Collapse is the default.** At β=0 only 6/8 experts stay alive — one takes 39% of tokens. The aux
+  loss revives them, and a *little* (β=0.001) does it at the **lowest** CE of all —
+  consistent with recovering otherwise-unused capacity; too much (β=0.01) over-regularizes and the task pays.
+- **Balance trades against specialization.** Left alone, the router carves the sharpest language
+  split; raising β softens it — yet **e7 stays disproportionately tied to 古文 tokens at every β>0**
+  (24–27% of poetry vs. 2–5% of English). The router finds the task boundary from the input alone;
+  balancing only blunts
+  how cleanly it may act on it.
+
+![P(expert | language) across the β sweep](nano/data/router_heatmap.png)
+
+*Each language leans on different experts (e4 and e1 at β=0; e7 stays disproportionately tied to 古文
+across the sweep); raising β spreads the load and softens the split — balance vs. specialization.*
+
+A router is **input-conditioned, adaptive allocation of compute**, and β makes its governing tension
+measurable: how evenly you force capacity to be used is in direct tension with how specialized it may
+become. The MoE *separates* the two scripts — it does not fuse them; whatever cross-lingual sharing
+exists lives in the embedding/attention/head, not the experts. Chinese is the harder side here: its
+character vocabulary is much larger and more Zipfian. Numbers are single-seed, MPS-scale, naive routing.
+
+## What this is — and isn't
+
+A reconstruction for **understanding**, not a model card: no FlashAttention, production KV cache,
+long context, or distributed training — by design. The standard it meets instead is that every mechanism it *does*
+have was rebuilt from its paper with a test that proves the signature property, shared as one source
+of truth across `nano` and the capstone, and reported with its limits stated — a negative result
+(extra capacity ⇏ lower loss at this scale) honestly kept beside the positive one it isolates
+(interpretable, input-conditioned routing). Reconstruction, not competition.
+
+## Reproduce
+
+```bash
+uv venv && uv pip install torch matplotlib regex
+python llm/nano/prepare.py                            # fetch the two corpora (~10 MB: arXiv + 全唐诗)
+python llm/bpe/experiment.py                          # tokenizer allocation: shared BPE budget on the two corpora
+python llm/nano/experiment.py --betas 0,0.001,0.01    # capstone: β sweep, routing table, heatmap, samples
+python llm/nano/experiment.py --dense                 # the dense control
+```
+
+Every component also runs standalone (`python llm/rope/rope.py`, …). `nano.py` and `experiment.py`
+**import** the hand-written components — one implementation, reused, not re-copied.
