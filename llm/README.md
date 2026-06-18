@@ -7,7 +7,9 @@ mini-Llama, then use sparse routing as the capstone experiment.
 
 Assembled and trained on a laptop GPU, it wrote this:
 
-![One 19M-parameter character model — two registers, one prompt each](nano/data/samples_panel.png)
+<p align="center">
+  <img src="nano/data/samples_panel.png" alt="One character model, two registers" width="760">
+</p>
 
 It runs at **character level** — one token per character, ~8,300 of them, no word vocabulary — which
 makes the feat precise: the model captures each distribution's *register* (ML-abstract cadence;
@@ -44,8 +46,8 @@ isolates *routing*, not tokenizer effects. The byte-level [`bpe`](bpe) is tested
 same two corpora, and it surfaces the same tension a layer earlier. It round-trips both exactly
 (byte-level BPE is lossless), but under one **shared merge budget** the scripts don't benefit
 equally: at vocab 2048, English reaches **3.26 chars/token** while Chinese stays **below 1.0 (0.86)**
-— most hanzi still span several byte-fragment tokens, and a fifth of the learned vocabulary is
-partial-character fragments. Dedicating the budget to Chinese roughly **doubles** hanzi-as-token
+— Chinese still averages more than one token per hanzi, and many rarer hanzi types remain split
+across byte-fragment tokens; a fifth of the learned vocabulary is partial-character fragments. Dedicating the budget to Chinese roughly **doubles** hanzi-as-token
 coverage, at English's expense. Frequency-based allocation favors the cheaper distribution — the
 MoE's balance↔specialization, before training even starts.
 
@@ -63,10 +65,9 @@ MoE β=0.001  19.5M    2.57    19% / 8-of-8     27% / 8-of-8    4.6
 MoE β=0.01   19.5M    2.84    23% / 7-of-8     24% / 7-of-8    4.0
 ```
 
-The control makes the loss story hard to overstate: **the 4× total capacity does not translate into a
+The control makes the loss story clear: **the 4× total capacity does not translate into a
 clear loss improvement** (2.57 vs 2.61, single-seed), and the dense model generates both scripts just
-as fluently. So the dual samples above are *character
-modeling*, not routing. The MoE's **one exclusive result** is *how it allocates* — and that is the
+as fluently. So the dual samples above are *character modeling*, not routing. The MoE's **one exclusive result** is *how it allocates* — and that is the
 interesting one. β (the load-balance weight in `loss = CE + β·aux`) exposes two coupled effects:
 
 - **Collapse is the default.** At β=0 only 6/8 experts stay alive — one takes 39% of tokens. The aux
@@ -78,7 +79,9 @@ interesting one. β (the load-balance weight in `loss = CE + β·aux`) exposes t
   balancing only blunts
   how cleanly it may act on it.
 
-![P(expert | language) across the β sweep](nano/data/router_heatmap.png)
+<p align="center">
+  <img src="nano/data/router_heatmap.png" alt="P(expert | language) across the beta sweep" width="720">
+</p>
 
 *Each language leans on different experts (e4 and e1 at β=0; e7 stays disproportionately tied to 古文
 across the sweep); raising β spreads the load and softens the split — balance vs. specialization.*
