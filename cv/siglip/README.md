@@ -108,7 +108,3 @@ wiring is correct. As in [`../clip`](../clip), the "zero-shot" test is not true 
 captions appear during training, so it shows classification *without a trained head*, not
 generalization to a held-out color–shape pair.
 
-> Next: back to [`../`](../) for the visual-token-budget sidetrack —
-> [`../tokbudget`](../tokbudget) / [`../framesample`](../framesample) /
-> [`../tokmerge`](../tokmerge) / [`../mrope`](../mrope) — where the system bottlenecks live. SigLIP is
-> the pre-training-objective detour off that line, not part of its trunk.
