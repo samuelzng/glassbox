@@ -223,7 +223,6 @@ llm/mla/
 llm/specdec/
 cv/framesample/
 cv/mrope/
-cv/siglip/
 cv/tokbudget/
 cv/tokmerge/
 .DS_Store

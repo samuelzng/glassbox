@@ -19,30 +19,31 @@ MANIFEST = {
     "cv/siglip":      ("vision",   "sigmoid 对齐目标",         "CLIP 的 softmax 对比 loss", "SigLIP · 2024+ VLM"),
     "cv/mae":         ("vision",   "掩码自监督预训练",         "有标签预训练",            "MAE 系视觉自监督"),
     "cv/videomae":    ("vision",   "视频掩码自监督",           "图像级自监督",            "VideoMAE"),
-    "cv/vl":          ("bridge",   "MLP projector · splice",   "原样塞所有 patch token",   "LLaVA / Qwen-VL"),
-    "cv/tokmerge":    ("bridge",   "2×2 token 合并",           "传全部 patch token",       "Qwen-VL merger"),
-    "cv/mrope":       ("bridge",   "M-RoPE 多模态位置",        "1D RoPE 处理多模态",       "Qwen2-VL / 2.5-VL"),
-    "cv/framesample": ("bridge",   "dynamic FPS 采样",         "固定均匀抽帧",            "所有视频 VLM"),
+    "cv/vl":          ("join",     "MLP projector · splice",   "原样塞所有 patch token",   "LLaVA / Qwen-VL"),
+    "cv/mrope":       ("join",     "M-RoPE 多模态位置",        "1D RoPE 处理多模态",       "Qwen2-VL / 2.5-VL"),
+    "cv/tokmerge":    ("budget",   "2×2 token 合并",           "传全部 patch token",       "Qwen-VL merger"),
+    "cv/framesample": ("budget",   "dynamic FPS 采样",         "固定均匀抽帧",            "所有视频 VLM"),
     "llm/bpe":        ("language", "BPE tokenizer",            "字符 / 词级切分",          "GPT · Llama · Qwen"),
     "llm/rope":       ("language", "RoPE 位置编码",            "正弦绝对位置",            "几乎所有现代 LLM"),
     "llm/rmsnorm":    ("language", "RMSNorm",                  "LayerNorm",               "Llama · Qwen"),
     "llm/swiglu":     ("language", "SwiGLU FFN",               "ReLU / GELU FFN",          "Llama · Qwen"),
     "llm/gqa":        ("language", "GQA",                      "MHA（多头全 KV）",         "Llama · Qwen"),
     "llm/nano":       ("language", "组装 · 小型 causal LLM",   "—",                        "把上面拼成可训练 LLM"),
-    "llm/kvcache":    ("language", "推理 KV 缓存",             "每步重算",                "所有自回归推理"),
-    "llm/localattn":  ("language", "局部 / 滑窗注意力",        "全 O(n²) 注意力",          "长上下文 · Qwen ViT 也用"),
+    "llm/kvcache":    ("inference","推理 KV 缓存",             "每步重算",                "所有自回归推理"),
+    "llm/localattn":  ("inference","局部 / 滑窗注意力",        "全 O(n²) 注意力",          "长上下文 · Qwen ViT 也用"),
     "llm/moe":        ("language", "MoE 稀疏 FFN",             "dense FFN",               "Qwen-MoE · DeepSeek"),
     "llm/mla":        ("language", "MLA 潜在注意力",           "MHA / GQA 的 KV",          "DeepSeek-V2/V3"),
-    "llm/specdec":    ("language", "投机解码",                 "逐 token 解码",            "推理加速"),
-    "cv/tokbudget":   ("ledger",   "全链 token 账本",          "凭感觉估 token",           "长视频系统设计"),
+    "llm/specdec":    ("inference","投机解码",                 "逐 token 解码",            "推理加速"),
+    "cv/tokbudget":   ("budget",   "全链 token 账本",          "凭感觉估 token",           "长视频系统设计"),
 }
 
 ZONES = [
-    ("vision",   "视觉塔",          "把图 / 帧切 patch、编码"),
-    ("bridge",   "视觉 → 语言 桥",  "压缩 token、投进 LLM、给位置"),
-    ("language", "语言骨干 · LLM",  "你的 nano 已把这些组装成可训练小 LLM"),
-    ("ledger",   "token 账本",      "横跨整条链 · 长视频的命门"),
-    ("other",    "其他 / 支线",     "manifest 未归类的组件"),
+    ("language",  "llm · 语言骨干",       "tokenizer、位置、norm、attention、FFN、nano 组装"),
+    ("vision",    "cv · 视觉塔",           "pixels / frames → patch tokens；图文预训练目标"),
+    ("join",      "VLM 接缝",              "projector + splice + multimodal positions"),
+    ("budget",    "视觉 token 预算支线",    "抽帧、合并、成本账本：控制进 LLM 的视觉序列长度"),
+    ("inference", "LLM 推理支线",          "cache、局部注意力、投机解码：服务与长上下文机制"),
+    ("other",     "其他 / 未归类",          "manifest 未归类的组件"),
 ]
 
 SKIP_STEMS = {"experiment", "prepare", "train_sanity", "build"}
@@ -122,7 +123,7 @@ def main():
     for c in comps:
         counts[c["mastery"]] = counts.get(c["mastery"], 0) + 1
     print(f"scanned {len(comps)} components -> {OUT}")
-    print(f"  explained {counts['explained']} · core {counts['core']} · spec {counts['spec']}")
+    print(f"  implemented+explained {counts['explained']} · implemented-core {counts['core']} · spec-only {counts['spec']}")
     for c in comps:
         print(f"  [{c['mastery']:9}] {c['key']:16} {c['code_file'] or '(no code)'}")
 
@@ -132,7 +133,7 @@ TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>我的 VLM 前沿构件掌握图</title>
+<title>glassbox VLM component map</title>
 <link rel="stylesheet" media="(prefers-color-scheme: light)" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
 <link rel="stylesheet" media="(prefers-color-scheme: dark)" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <style>
@@ -196,14 +197,14 @@ pre.src{margin:0;border-radius:8px;font-size:12.5px;max-height:60vh;overflow:aut
 <body>
 <div class="wrap">
   <header class="head">
-    <h1>我的 VLM 前沿构件掌握图</h1>
-    <div class="sub">锚 · Qwen-VL ｜ 数据实时扫描自 <code>cv/</code> 和 <code>llm/</code></div>
+    <h1>glassbox · VLM component map</h1>
+    <div class="sub">two tracks: <code>llm/</code> language backbone + <code>cv/</code> vision tower · join: <code>cv/vl</code> + <code>cv/mrope</code></div>
     <div class="seg" id="seg"></div>
     <div class="cnt" id="cnt"></div>
     <div class="legend">
-      <span><i class="dot" style="background:var(--done)"></i>实现 · 能讲</span>
-      <span><i class="dot" style="background:var(--core)"></i>写了核心</span>
-      <span><i class="dot" style="background:var(--spec)"></i>spec · 待做</span>
+      <span><i class="dot" style="background:var(--done)"></i>已实现 · 有实验/讲解</span>
+      <span><i class="dot" style="background:var(--core)"></i>已实现 · core code</span>
+      <span><i class="dot" style="background:var(--spec)"></i>未实现 · spec only</span>
     </div>
   </header>
   <main class="zones" id="zones"></main>
@@ -214,7 +215,7 @@ pre.src{margin:0;border-radius:8px;font-size:12.5px;max-height:60vh;overflow:aut
 <script>
 const DATA = __DATA__;
 const MC = {explained:'var(--done)', core:'var(--core)', spec:'var(--spec)'};
-const ML = {explained:'实现·能讲', core:'写了核心', spec:'spec'};
+const ML = {explained:'已实现 · 有实验/讲解', core:'已实现 · core code', spec:'未实现 · spec only'};
 const byKey = Object.fromEntries(DATA.components.map(c=>[c.key,c]));
 
 function renderZones(){
@@ -244,7 +245,8 @@ function renderProgress(){
   document.getElementById('seg').innerHTML=['explained','core','spec']
     .map(m=>k[m]?'<span style="width:'+(k[m]/n*100).toFixed(1)+'%;background:'+MC[m]+'"></span>':'').join('');
   document.getElementById('cnt').textContent=
-    '共 '+n+' 个构件 · 实现并能讲 '+k.explained+' · 写了核心 '+k.core+' · 待做 '+k.spec;
+    '共 '+n+' 个构件 · 已实现 '+(k.explained+k.core)+' · 未实现/spec '+k.spec+
+    ' · join 核心：cv/vl + cv/mrope';
 }
 
 let tab='notes';
@@ -258,11 +260,11 @@ function select(key){
   d.innerHTML =
     '<h2>'+c.key+'</h2>'+
     '<div class="meta"><i class="dot" style="background:'+MC[c.mastery]+'"></i>'+ML[c.mastery]+
-      ' &nbsp;·&nbsp; Qwen：'+(c.qwen||'—')+'</div>'+
+      ' &nbsp;·&nbsp; role：'+(c.qwen||'—')+'</div>'+
     (c.replaces?'<div class="row"><span>取代</span><span>'+c.replaces+'</span></div>':'')+
     (c.who?'<div class="row"><span>在用</span><span>'+c.who+'</span></div>':'')+
     (c.code_file?'<div class="row"><span>代码</span><span>'+c.key+'/'+c.code_file+'</span></div>':'')+
-    '<div class="tabs"><button class="tab" data-t="notes">笔记 README</button>'+
+    '<div class="tabs"><button class="tab" data-t="notes">README</button>'+
       '<button class="tab" data-t="code">代码</button></div>'+
     '<div id="pane"></div>';
   d.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{tab=b.dataset.t;paint(notes,codeHtml);});
@@ -280,7 +282,7 @@ function escapeHtml(s){return s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>'
 
 renderProgress(); renderZones();
 </script>
-<div class="wrap"><div class="foot">build.py 扫描自动生成 · 每复现一个组件、重跑 build.py 即同步</div></div>
+<div class="wrap"><div class="foot">generated from cv/ and llm/ only · rerun <code>.venv/bin/python docs/build.py</code> after component changes</div></div>
 </body>
 </html>"""
 

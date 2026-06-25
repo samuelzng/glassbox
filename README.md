@@ -1,6 +1,14 @@
 # glassbox
 
-Minimal from-scratch implementations of the mechanisms behind modern AI: LLM architecture, RL post-training, and vision. Each component covers one mechanism in isolation.
+Minimal from-scratch implementations of the components inside a vision-language
+model (VLM), anchored on Qwen-VL.
+
+Two tracks. `llm` is the language backbone — how a modern decoder-only LLM differs
+from the original Transformer. `cv` is the vision tower — pixels to patch tokens.
+They are independent bodies of work; the point of this repo is the seam where they
+join: `cv/vl` splices vision tokens into the backbone and `cv/mrope` gives them
+multimodal positions. That join is the VLM. Each directory builds one mechanism in
+isolation.
 
 ## llm
 
@@ -19,18 +27,6 @@ How a current decoder-only LLM differs from the original Transformer.
 | [`mla`](llm/mla) | multi-head latent attention | [2405.04434](https://arxiv.org/abs/2405.04434) |
 | [`localattn`](llm/localattn) | sliding-window + local/global attention | [2310.06825](https://arxiv.org/abs/2310.06825) |
 | [`specdec`](llm/specdec) | speculative decoding | [2211.17192](https://arxiv.org/abs/2211.17192) |
-
-## posttrain
-
-Aligning a base model, from RLHF through the critic-free methods behind recent reasoning models.
-
-| dir | mechanism | paper |
-|---|---|---|
-| [`sft`](posttrain/sft) | supervised fine-tuning | [2203.02155](https://arxiv.org/abs/2203.02155) |
-| [`reward-model`](posttrain/reward-model) | scalar reward from preference pairs | [2009.01325](https://arxiv.org/abs/2009.01325) |
-| [`ppo-rlhf`](posttrain/ppo-rlhf) | the RLHF loop with PPO | [1707.06347](https://arxiv.org/abs/1707.06347) |
-| [`dpo`](posttrain/dpo) | preference optimization without a reward model | [2305.18290](https://arxiv.org/abs/2305.18290) |
-| [`grpo`](posttrain/grpo) | group-relative advantages, no critic | [2402.03300](https://arxiv.org/abs/2402.03300) |
 
 ## cv
 
@@ -51,4 +47,12 @@ From pixels to tokens, then the 2024–25 question: how to spend the visual-toke
 
 ## Layout
 
-Each directory documents one mechanism (what it is, how it differs from the baseline it replaces, its tensor-shape contract) as the spec for a single-file PyTorch implementation. No pretrained weights, no large datasets.
+Each directory documents one mechanism (what it is, how it differs from the
+baseline it replaces, its tensor-shape contract) as the spec for a single-file
+PyTorch implementation. No pretrained weights, no large datasets. `docs/` holds a
+generated mastery map of these components — run
+`.venv/bin/python docs/build.py` and open `docs/index.html`.
+
+---
+Part of the glass\* line of from-scratch reproductions:
+`glassbox` (a VLM's internals) · `glassalign` (post-training) · `glassloop` (the agent loop).
