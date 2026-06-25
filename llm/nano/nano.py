@@ -42,9 +42,20 @@ class NanoLLM(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-    def forward(self, ids):
-        L = ids.shape[1]
-        x = self.embed(ids)
+    def forward(self, ids=None, targets=None, inputs_embeds=None, input_embeds=None):
+        if inputs_embeds is not None and input_embeds is not None:
+            raise ValueError("pass only one of inputs_embeds or input_embeds")
+        if inputs_embeds is None:
+            inputs_embeds = input_embeds
+        if inputs_embeds is None:
+            if ids is None:
+                raise ValueError("ids or inputs_embeds is required")
+            L = ids.shape[1]
+            x = self.embed(ids)
+        else:
+            L = inputs_embeds.shape[1]
+            x = inputs_embeds
+
         for block in self.blocks:
             x = block(x, self.cos[:L], self.sin[:L])
         self.aux = sum((b.aux for b in self.blocks if b.aux is not None), 0)  # scalar; 0 if dense
@@ -93,5 +104,3 @@ if __name__ == "__main__":
         logits = model(ids[:, -model.max_len:])                  # crop to the rope cache
         ids = torch.cat([ids, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
     print(f"\ngreedy from {text[:8]!r}:\n{''.join(chars[i] for i in ids[0])}")
-
-

@@ -67,7 +67,3 @@ falls to `~0.05` as the model memorizes the text, after which greedy decoding re
 This is memorization on purpose, not generalization: on a few hundred characters the only claim
 being proved is that the assembled pipeline trains and generates end-to-end. It is also the first
 time the four hand-written components, composed through imports, run together as one model.
-
-> Next: cache the decode and sample in [`../kvcache`](../kvcache); swap the FFN for a sparse one
-> in [`../moe`](../moe); this mini-Llama is also the base for the whole
-> [`../../posttrain`](../../posttrain) line.
