@@ -1,18 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sys, pathlib
 
-class SwiGLU(nn.Module):
-    # the expert is just a dense FFN (see ../swiglu)
-    def __init__(self, d, hidden=None):
-        super().__init__()
-        hidden = hidden or int(2 / 3 * 4 * d)
-        self.w_gate = nn.Linear(d, hidden, bias=False)
-        self.w_up = nn.Linear(d, hidden, bias=False)
-        self.w_down = nn.Linear(hidden, d, bias=False)
-
-    def forward(self, x):
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # put llm/ on the path
+from swiglu.swiglu import SwiGLU
 
 
 class MoE(nn.Module):
