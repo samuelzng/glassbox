@@ -1,105 +1,90 @@
-# cv/vl — Vision → token → LLM 拼接（LLaVA-style）
+# cv/vl — Vision-Language Model (the splice)
 
-> **📌 一手出处 / official reference**
-> - 论文 *Visual Instruction Tuning*（LLaVA）— Liu et al., NeurIPS 2023 · [arXiv:2304.08485](https://arxiv.org/abs/2304.08485)
-> - 官方实现 [haotian-liu/LLaVA](https://github.com/haotian-liu/LLaVA)
+A VLM is a language model that can see. The whole trick is one move: turn an image into a short
+list of vectors that live in the LM's embedding space, then **drop those vectors into the token
+sequence where a few `<image>` placeholder tokens sit**, and hand the spliced sequence to an
+ordinary causal LM. Nothing about the LM changes — no cross-attention, no adapters, no gating. The
+image becomes *just more tokens*, and the LM's own self-attention does all the cross-modal work
+(subject to the causal mask, so text after the image can attend to it, text before cannot). This is
+the LLaVA-family "decoder-only / early-fusion" design, and it is almost embarrassingly mechanical:
+the splice itself is a boolean-mask scatter with zero learnable parts. The intelligence is upstream
+(a vision tower that encodes the image, a projector that lands it in the right space) and downstream
+(the LM that reads it) — the bridge in the middle is dumb on purpose. Three pieces meet here: a ViT
+vision tower (reused from [`../vit`](../vit), encoder mode, no `[CLS]`), a **modality projector**
+(pixel shuffle + 2-layer MLP), and a causal LM (reused from [`../../llm/nano`](../../llm/nano),
+which already accepts `inputs_embeds`).
 
-> 学习笔记 + 复现 spec。目标：复现完 [`vl.py`](vl.py) 后，能讲清
-> **视觉 token 如何拼进 LLM 序列、projector 的角色**。这是 CV 线接 [`../../llm`](../../llm) 的桥。
-> 复习时：先做文末盲讲检查点，全答上来就直接跑代码。
-
-## 一句话 mental model
-
-图过一个**冻结的** ViT 拿 patch 特征 → 一个 **projector (MLP)** 把它投到 LLM 的词向量空间 →
-把这些视觉向量**塞进文本序列里 `<image>` 占位符的位置** → LLM 拿到一条 `[文本|视觉|文本]` 的混合
-序列，做**普通 causal self-attention**，根本不区分哪些位置来自像素、哪些来自单词。
-
-## 🎯 先猜：LLM 怎么区分序列里哪些 token 来自图、哪些来自文字？（想 30 秒）
-
-**答案：它根本不区分。projector 把视觉单位变成 `d_llm` 向量后，和文本 token 一视同仁做 causal
-attention。projector 扮演的就是「图像的 embedding 层」。**
-
-```
-文本:  token id        ──nn.Embedding──►  d_llm 向量
-图像:  ViT patch 特征   ──projector(MLP)──►  d_llm 向量      ← 同一个目标空间！
-```
-
-文本进 Transformer 靠 `token id → 查表 → 向量`；图像没有 id，但 projector 扮演**完全对称**的
-角色：把视觉单位变成一个 LLM 能吃的 `d_llm` 向量。一旦都变成 `d_llm` 向量，拼在一起 LLM 一视同仁。
-**整个组件最值钱的就是 `embed_sequence` 里 `merged[is_img] = vis` 那一行。**
-
-## tensor 流（`vl.py` 的 shape walk）
+> **References** — Liu et al., *Visual Instruction Tuning* (LLaVA), NeurIPS 2023
+> ([arXiv:2304.08485](https://arxiv.org/abs/2304.08485)) — the splice / early-fusion paradigm ·
+> HuggingFace [nanoVLM](https://github.com/huggingface/nanoVLM) — the reference implementation this
+> mirrors · pixel-shuffle visual-token compression from the Idefics3 / SmolVLM lineage
+> ([arXiv:2504.05299](https://arxiv.org/abs/2504.05299)).
 
 ```
-pixels [B,3,32,32] ─ frozen ViT(patch16→4 patch) ─► feats [B,4,d_vision]
-                       │ projector (Linear→GELU→Linear)
-                       ▼
-                     vis [B,4,d_llm]              ← 视觉 token，已在词向量空间
-文本 ids [B,7]=[BOS,IMG,IMG,IMG,IMG,<colour>,EOS] ─ tok_embed ─► [B,7,d_llm]
-                       │  *** 把 vis 覆盖到 IMG 占位符的 4 个位置 ***
-                       ▼
-merged [B,7,d_llm]=[BOS|vis0 vis1 vis2 vis3|colour|EOS]
-                       │ + 位置编码 → causal Transformer
-                       ▼
-logits [B,7,vocab]     → 在最后一个 IMG 位置预测颜色词
+image [B,3,H,W]                              text ids [B,T]   (L_img <image> placeholders per image)
+   │  ViT encoder (num_classes=0, no CLS)        │  decoder.embed
+   ▼                                             ▼
+patches [N_img, 64, d_vit]                    embeds [B, T, D]      (placeholder rows hold garbage)
+   │  pixel shuffle: 64 → 64/s² tokens,          │
+   │  d_vit → d_vit·s²  (space → channel)         │
+   │  MLP: Linear(d_vit·s² → D) · GELU · Linear(D → D)
+   ▼                                             │
+visual [N_img, L_img, D] ───── splice ─────────▶ embeds[ids == <image>] = visual.reshape(-1, D)
+                                                 │   boolean scatter · #placeholders == #visual tokens
+                                                 ▼
+                                           sequence [B, T, D]
+                                                 │  unmodified causal LM (NanoLLM, inputs_embeds)
+                                                 ▼
+                                           logits [B, T, vocab]
 ```
 
-## toy 任务为什么能验证「视觉真进了 LLM」
+**Pixel shuffle** is the only non-obvious operation, and it carries the whole token-budget story. It
+is `view`+`reshape`+`permute`+`reshape` — no learnable parameters — that merges each `s×s` block of
+spatial patches into one fat token: token count ÷ s², channel dim × s². It is lossless (a pure
+re-layout, space moved into channels); the actual compression happens in the MLP that follows, whose
+first layer is sized `d_vit·s² → D`. So `s` (`mp_pixel_shuffle_factor`) is the budget dial — one
+image costs `(img/patch)² / s²` tokens in the LM sequence. **The splice**
+(`_replace_img_tokens_with_embd`) is the heart: `mask = input_ids == image_token_id` finds every
+placeholder across the batch, and `out[mask] = visual.reshape(-1, D)` overwrites them in one
+vectorized assignment. Boolean indexing flattens row-major and the visual tokens are stacked in the
+same order, so the only requirement is a **counting contract** — total placeholders must equal total
+visual tokens — asserted in place. This is why data prep inserts exactly `mp_image_token_length`
+placeholders per image. The loss masks every non-answer position with `ignore_index=-100`, so the
+model is never trained to "predict" image tokens.
 
-图像是一个**随机颜色方块**，文本模板对所有样本都一样、要 LLM 说出颜色名。**区分样本的唯一信息
-就是图像**。所以只有当梯度沿 `LM → 视觉 token → projector` 回传、projector 学会把像素特征变成
-LM 读得懂的 token，颜色准确率才可能上去。✓ 证明 concat pipeline 端到端可微、视觉信息确实流进了 LM。
+## Experiment (`python vl.py`)
 
-## 和真实 LLaVA 的关系（两阶段）
+A real but tiny training run, not a forward-only assertion: a synthetic world of one colored shape on
+a near-black field (6 colors × 3 shapes, where shape is a distractor), prompt `[<image>×L, "color?"]`,
+supervised only at the query slot. Runs in under a minute on MPS.
 
-| | 冻结 | 训练 | 目的 |
-|---|---|---|---|
-| Stage 1 对齐 | 预训练 LLM + ViT | **只训 projector** | 让 projector 学会翻译到 LLM 词空间 |
-| Stage 2 指令微调 | ViT（通常） | projector + **解冻 LLM** | 教模型按指令用视觉信息 |
-
-本 toy 的小 LM 是**从零和 projector 一起训**的（它没有语言先验，冻结无意义）；真实 LLaVA stage-1
-是冻结预训练 LM、只训 projector。被演示的**机制**（projector + splice + 混合序列 causal attention）两者一样。
-
-## 你要复现的目标（TODO）
-
-文件：`vl.py`、`train_sanity.py`。视觉塔可复用 [`../vit`](../vit)，LM 用 [`../../llm/nano`](../../llm/nano) 的 causal 版。
-
-```python
-class VLModel(nn.Module):
-    # vision (frozen ViT) + projector(MLP d_vision→d_llm) + lm(causal Transformer)
-    def embed_sequence(self, ids, pixels):
-        emb = tok_embed(ids)                 # [B,L,d_llm]
-        vis = projector(vision(pixels))      # [B,n_img,d_llm]
-        emb[ids == IMG_TOKEN] = vis.reshape(-1, d_llm)   # ★ splice
-        return emb
+```
+world    6 colors x 3 shapes | image 32x32 -> 64 patches | device mps | chance 17%
+learns   s=2  16 img-tokens  loss 2.10 -> 0.00   color-acc 100%
+blind    same prompt, image removed              color-acc 23%  (~chance)
+budget   s   img-tokens   seq-len   rel-attn-cost   color-acc
+          1       64          65        1.00x         100%
+          2       16          17        0.07x         100%
+          4        4           5        0.01x         100%
 ```
 
-splice 那行的隐藏前提（写错就静默错位）：`ids == IMG_TOKEN` 的布尔 mask 按**行优先**展平，
-`vis.reshape(-1, d_llm)` 也按 batch×n_img 行优先展平——两边顺序必须一致，且
-**占位符个数 == 视觉 token 数**（每张图 n_img 个，整个 batch 共 `B·n_img` 个 IMG）。
-先写一条断言把这两个数卡死，再训练。
+- **learns** — with the image spliced in, the LM learns to name the color off the visual tokens
+  through ordinary causal attention: loss collapses, accuracy hits 100% from a 17% floor. The bridge
+  works end-to-end, trained from scratch (no pretrained backbones — so unlike real LLaVA there is
+  nothing to freeze; the projector and both towers learn together).
+- **blind** — feed the *same* prompt with no image (splice skipped, so the placeholder rows keep a
+  single constant, color-free embedding) and accuracy falls back to chance. The one thing removed is
+  the visual signal, so this pins the accuracy *to the splice* — it is not the prompt leaking the
+  answer.
+- **budget** — `s` sets how many tokens one image costs. A low-detail answer (color) survives heavy
+  compression: at `s=4` the image is 4 tokens instead of 64 (16× fewer), the O(T²) attention cost
+  drops ~170×, and accuracy stays 100%. On a question that needs no spatial detail, the visual budget
+  is almost all slack — the opening that adaptive token allocation exploits.
 
-## 🪜 实现阶梯（每级跑通断言再上一级）
+This is the **mechanism** sanity — that vision flows through the splice and the budget dial behaves —
+not a capability result. A harder, detail-dependent question (e.g. *which* shape, or counting) is
+where the budget sweep would start to bite, and where a learned, per-image token allocation would
+have to earn its keep.
 
-1. **冻结 ViT + projector 出视觉 token**：断言 `vis` 是 `[B,n_img,d_llm]`，且
-   `vision` 的参数 `requires_grad=False`（冻结真的生效了）。
-2. **splice**：断言 IMG 占位符个数 == `B·n_img`；splice 后非 IMG 位置的 embedding 和
-   `tok_embed(ids)` 逐元素相等（只覆盖了该覆盖的位置）。
-3. **端到端 forward + 训练**：跑 ⭐，颜色准确率 → 1.0。
-4. **可微性反证**（机制的直接证据）：把 projector 的梯度 detach 掉再训一次 → 准确率卡在
-   chance。证明「颜色信息只能沿 LM→视觉 token→projector 这条路回传」。
-
-## ⭐ 必做的 sanity
-
-`train_sanity.py`：训 ~400 步，颜色准确率 →1.0，存 `predictions.png`。
-
-## ✅ 盲讲检查点
-
-1. projector 的作用用一句话类比？
-2. 视觉向量怎么「进入」序列？维度为什么必须是 `d_llm`？
-3. LLM 怎么区分视觉 token 和文本 token？
-4. 为什么这个 toy 必须靠图像才能答对颜色？
-5. 真实 LLaVA 两阶段分别冻结/训练什么？本 toy 哪里不同、为什么？
-6. 和 [`../clip`](../clip) 的「对比对齐」相比，这条路线打通图文的方式有何本质不同？
-
-> CV 主线收尾，也接上了 [`../../llm`](../../llm)。三条主线读完回 [根 README](../..) 总览。
+> Next: the visual-token-budget line this rides on — [`../tokbudget`](../tokbudget) and
+> [`../tokmerge`](../tokmerge).
